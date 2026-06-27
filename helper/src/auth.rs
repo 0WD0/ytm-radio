@@ -15,7 +15,10 @@ use tungstenite::{connect, Message, WebSocket};
 
 const YTM_ORIGIN: &str = "https://music.youtube.com";
 const YTM_ORIGIN_ENCODED: &str = "https%3A%2F%2Fmusic.youtube.com";
+#[cfg(target_os = "macos")]
 const DEFAULT_DIA_LOGIN_BROWSER_PATH: &str = "/Applications/Dia.app/Contents/MacOS/Dia";
+#[cfg(target_os = "macos")]
+const DEFAULT_ZEN_LOGIN_BROWSER_PATH: &str = "/Applications/Zen Browser.app/Contents/MacOS/zen";
 const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -429,20 +432,37 @@ fn login_browser_is_running(browser: &LoginBrowser) -> bool {
 
 #[cfg(target_os = "linux")]
 fn login_browser_is_running(browser: &LoginBrowser) -> bool {
-    let Some(process_name) = browser
+    login_browser_process_names(browser)
+        .iter()
+        .any(|process_name| {
+            Command::new("pgrep")
+                .args(["-x", process_name])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn login_browser_process_names(browser: &LoginBrowser) -> Vec<String> {
+    let mut process_names = Vec::new();
+    if let Some(process_name) = browser
         .executable
         .file_name()
         .and_then(|name| name.to_str())
-    else {
-        return false;
-    };
-    Command::new("pgrep")
-        .args(["-x", process_name])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    {
+        process_names.push(process_name.to_string());
+    }
+    if browser.name == "zen" {
+        process_names.extend([
+            "zen".to_string(),
+            "zen-bin".to_string(),
+            "zen-browser".to_string(),
+        ]);
+    }
+    dedup_strings(process_names)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -699,7 +719,7 @@ fn resolve_login_browser(requested: Option<&str>) -> Result<LoginBrowser, String
             return Ok(browser);
         }
         return Err(format!(
-            "cannot find login browser `{requested}`; try chrome, brave, edge, chromium, firefox, dia, or an executable path"
+            "cannot find login browser `{requested}`; try chrome, brave, edge, chromium, firefox, zen, dia, or an executable path"
         ));
     }
 
@@ -712,7 +732,7 @@ fn resolve_default_login_browser() -> Result<LoginBrowser, String> {
         return Ok(browser);
     }
     Err(format!(
-        "default login browser `{}` is not available; set ytm-radio-helper-login-browser to chrome, brave, edge, chromium, firefox, dia, or an executable path",
+        "default login browser `{}` is not available; set ytm-radio-helper-login-browser to chrome, brave, edge, chromium, firefox, zen, dia, or an executable path",
         browser.executable.display()
     ))
 }
@@ -861,7 +881,7 @@ fn command_stdout(program: &str, arguments: &[&str]) -> Option<String> {
 fn supported_default_login_browser(executable: PathBuf) -> Result<LoginBrowser, String> {
     let Some((name, protocol)) = supported_login_browser(&executable) else {
         return Err(format!(
-            "default browser `{}` is not supported for login; set ytm-radio-helper-login-browser to chrome, brave, edge, chromium, firefox, dia, or a compatible executable path",
+            "default browser `{}` is not supported for login; set ytm-radio-helper-login-browser to chrome, brave, edge, chromium, firefox, zen, dia, or a compatible executable path",
             executable.display()
         ));
     };
@@ -891,6 +911,10 @@ fn supported_login_browser(executable: &Path) -> Option<(String, LoginProtocol)>
         Some(("chromium".to_string(), LoginProtocol::Cdp))
     } else if path.contains("firefox") || file == "firefox" {
         Some(("firefox".to_string(), LoginProtocol::Bidi))
+    } else if path.contains("zen browser")
+        || matches!(file.as_str(), "zen" | "zen-bin" | "zen-browser")
+    {
+        Some(("zen".to_string(), LoginProtocol::Bidi))
     } else if path.contains("/dia.app/") || file == "dia" {
         Some(("dia".to_string(), LoginProtocol::Cdp))
     } else {
@@ -1025,6 +1049,7 @@ fn login_browser_candidates() -> Vec<LoginBrowser> {
                 "firefox",
                 "/Applications/Firefox.app/Contents/MacOS/firefox",
             ),
+            login_browser("zen", DEFAULT_ZEN_LOGIN_BROWSER_PATH),
             login_browser("dia", DEFAULT_DIA_LOGIN_BROWSER_PATH),
         ]);
         if let Some(home) = std::env::var_os("HOME") {
@@ -1055,6 +1080,11 @@ fn login_browser_candidates() -> Vec<LoginBrowser> {
                     home.join("Applications/Firefox.app/Contents/MacOS/firefox"),
                     LoginProtocol::Bidi,
                 ),
+                login_browser_path(
+                    "zen",
+                    home.join("Applications/Zen Browser.app/Contents/MacOS/zen"),
+                    LoginProtocol::Bidi,
+                ),
             ]);
         }
     }
@@ -1069,6 +1099,9 @@ fn login_browser_candidates() -> Vec<LoginBrowser> {
             login_browser("chromium", "chromium-browser"),
             login_browser("firefox", "firefox"),
             login_browser("firefox", "firefox-developer-edition"),
+            login_browser("zen", "zen-browser"),
+            login_browser("zen", "zen-bin"),
+            login_browser("zen", "zen"),
         ]);
     }
     candidates
@@ -1091,7 +1124,7 @@ fn login_browser_path(name: &str, executable: PathBuf, protocol: LoginProtocol) 
 }
 
 fn login_browser_protocol(name: &str) -> LoginProtocol {
-    if name.eq_ignore_ascii_case("firefox") {
+    if matches!(name.to_ascii_lowercase().as_str(), "firefox" | "zen") {
         LoginProtocol::Bidi
     } else {
         LoginProtocol::Cdp
@@ -1943,13 +1976,17 @@ mod tests {
         assert_eq!(
             effective_login_profile_dir(
                 output,
-                &login_browser("dia", DEFAULT_DIA_LOGIN_BROWSER_PATH),
+                &login_browser("dia", "/Applications/Dia.app/Contents/MacOS/Dia"),
                 None
             ),
             None
         );
         assert_eq!(
             effective_login_profile_dir(output, &login_browser("firefox", "firefox"), None),
+            None
+        );
+        assert_eq!(
+            effective_login_profile_dir(output, &login_browser("zen", "zen-browser"), None),
             None
         );
     }
@@ -1982,17 +2019,19 @@ mod tests {
     }
 
     #[test]
-    fn resolves_firefox_path_to_bidi_login_browser() {
+    fn resolves_firefox_and_zen_paths_to_bidi_login_browser() {
         let directory = temporary_test_directory();
         fs::create_dir_all(&directory).unwrap();
-        let browser = directory.join("firefox");
-        fs::write(&browser, "").unwrap();
+        for (executable, expected_name) in [("firefox", "firefox"), ("zen-browser", "zen")] {
+            let browser = directory.join(executable);
+            fs::write(&browser, "").unwrap();
 
-        let resolved = resolve_login_browser(Some(browser.to_str().unwrap())).unwrap();
+            let resolved = resolve_login_browser(Some(browser.to_str().unwrap())).unwrap();
 
-        assert_eq!(resolved.name, "firefox");
-        assert_eq!(resolved.executable, browser);
-        assert_eq!(resolved.protocol, LoginProtocol::Bidi);
+            assert_eq!(resolved.name, expected_name);
+            assert_eq!(resolved.executable, browser);
+            assert_eq!(resolved.protocol, LoginProtocol::Bidi);
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2015,6 +2054,25 @@ mod tests {
         assert_eq!(
             supported_login_browser(Path::new("/usr/bin/firefox")),
             Some(("firefox".to_string(), LoginProtocol::Bidi))
+        );
+        assert_eq!(
+            supported_login_browser(Path::new(
+                "/Applications/Zen Browser.app/Contents/MacOS/zen"
+            )),
+            Some(("zen".to_string(), LoginProtocol::Bidi))
+        );
+        assert_eq!(
+            supported_login_browser(Path::new("/opt/zen-browser-bin/zen-bin")),
+            Some(("zen".to_string(), LoginProtocol::Bidi))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zen_browser_process_detection_checks_wrapper_and_real_binary_names() {
+        assert_eq!(
+            login_browser_process_names(&login_browser("zen", "zen-browser")),
+            vec!["zen-browser", "zen", "zen-bin"]
         );
     }
 

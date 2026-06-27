@@ -347,17 +347,17 @@ ytm-radio opens the login browser at `https://music.youtube.com`. Sign in there
 if needed. The helper waits for the logged-in YouTube Music page to expose
 cookies and page context, then writes the auth JSON.
 
-The login browser must be started with a local DevTools endpoint. If you opt
-into the browser's normal profile and that browser is already running without
-the endpoint, ytm-radio asks before restarting it once. Chrome uses a
+The login browser must be started with a local remote-control endpoint. If you
+opt into the browser's normal profile and that browser is already running
+without the endpoint, ytm-radio asks before restarting it once. Chrome uses a
 helper-managed non-default profile when needed to satisfy Chrome's DevTools
 profile requirement.
 
 The login flow:
 
-1. opens the login browser with a local DevTools endpoint;
+1. opens the login browser with a local remote-control endpoint;
 2. waits for sign-in to finish;
-3. reads YouTube Music cookies and `ytcfg` page context through DevTools;
+3. reads YouTube Music cookies and `ytcfg` page context through the browser protocol;
 4. writes a private JSON file with mode `0600` on Unix;
 5. clears the helper bootstrap cache;
 6. refreshes Home asynchronously.
@@ -380,20 +380,20 @@ older checkout, ytm-radio copies them into the new directory on first startup.
 
 By default, ytm-radio opens the system default browser when that browser has a
 supported login flow. Chromium-based browsers use the DevTools protocol;
-Firefox uses WebDriver BiDi. On macOS this uses the default application for
+Firefox-compatible browsers use WebDriver BiDi. On macOS this uses the default application for
 `https://` URLs. On Linux this uses the default `x-scheme-handler/https`
 desktop entry.
 
 Set a preferred login browser when the default browser is unsupported or when
 you want a specific browser. Use `chrome`, `brave`, `edge`, `chromium`,
-`firefox`, `dia`, or an executable path:
+`firefox`, `zen`, `dia`, or an executable path:
 
 ```elisp
 (setq ytm-radio-helper-login-browser "chrome")
 ```
 
-By default, the helper uses browser-specific profile behavior. Dia and Firefox
-use their normal profile. Chrome uses an isolated profile next to the auth file
+By default, the helper uses browser-specific profile behavior. Non-Chrome
+browsers use their normal profile. Chrome uses an isolated profile next to the auth file
 when no explicit profile is configured. With the default auth file, that is
 `~/.ytm-radio/login-profile/`. Chrome 136 and newer do not enable DevTools for
 the default Chrome profile. If you want a specific isolated login profile for
@@ -407,9 +407,10 @@ any supported browser, set:
 Set `ytm-radio-helper-login-profile-directory` to nil to use the helper's
 browser-specific default behavior.
 
-Firefox is supported through WebDriver BiDi. If Firefox is already running
-without the helper's remote control port, close it before login or configure an
-isolated profile directory so ytm-radio can start a separate Firefox instance.
+Firefox-compatible browsers are supported through WebDriver BiDi. If the
+browser is already running without the helper's remote control port, close it
+before login or configure an isolated profile directory so ytm-radio can start a
+separate browser instance.
 
 The default local browser remote-control port is `29317`:
 

@@ -203,8 +203,8 @@ The file contents are never persisted in ytm-radio state."
 (defcustom ytm-radio-helper-login-browser nil
   "Browser executable or known browser name used for account login.
 When nil, the helper uses the system default browser when it supports a
-known login flow.  Chromium-based browsers use DevTools; Firefox uses
-WebDriver BiDi."
+known login flow.  Chromium-based browsers use DevTools; Firefox-compatible
+browsers use WebDriver BiDi."
   :type '(choice (const :tag "Auto" nil)
                  string)
   :group 'ytm-radio)
