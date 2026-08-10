@@ -160,20 +160,6 @@ fn parses_continuation_command() {
 }
 
 #[test]
-fn parses_proxy_for_login_window() {
-    let options = parse_args([
-        "auth",
-        "login-window",
-        "--output",
-        "/tmp/ytm/auth.json",
-        "--proxy",
-        "http://127.0.0.1:8888",
-    ])
-    .unwrap();
-    assert_eq!(options.proxy, Some("http://127.0.0.1:8888".to_string()));
-}
-
-#[test]
 fn parses_rate_command() {
     let options = parse_args(["rate", VIDEO_ID, "like", "--mock"]).unwrap();
     assert_eq!(
@@ -303,76 +289,45 @@ fn rejects_unknown_library_action() {
 }
 
 #[test]
-fn parses_login_window_command_with_defaults() {
-    let options = parse_args(["auth", "login-window", "--output", "/tmp/ytm/auth.json"]).unwrap();
+fn parses_capture_import_command() {
+    let options = parse_args([
+        "auth",
+        "import-capture",
+        "--capture",
+        "/tmp/capture.json",
+        "--output",
+        "/tmp/auth.json",
+    ])
+    .unwrap();
     assert_eq!(
         options.command,
-        Command::AuthLoginWindow {
-            output: PathBuf::from("/tmp/ytm/auth.json"),
-            browser: None,
-            profile_dir: None,
-            port: DEFAULT_LOGIN_CDP_PORT,
-            timeout_secs: DEFAULT_LOGIN_TIMEOUT_SECS,
-            restart_running: false,
+        Command::AuthImportCapture {
+            capture: PathBuf::from("/tmp/capture.json"),
+            output: PathBuf::from("/tmp/auth.json"),
         }
     );
 }
 
 #[test]
-fn parses_login_window_command_with_browser_profile_and_timeout() {
-    let options = parse_args([
+fn rejects_removed_browser_options() {
+    let error = parse_args([
         "auth",
-        "login-window",
+        "import-capture",
+        "--capture",
+        "/tmp/capture.json",
         "--output",
         "/tmp/auth.json",
         "--browser",
-        "brave",
-        "--profile-dir",
-        "/tmp/profile",
-        "--port",
-        "29998",
-        "--timeout-secs",
-        "60",
-        "--restart-running",
+        "chrome",
     ])
-    .unwrap();
-    assert_eq!(
-        options.command,
-        Command::AuthLoginWindow {
-            output: PathBuf::from("/tmp/auth.json"),
-            browser: Some("brave".to_string()),
-            profile_dir: Some(PathBuf::from("/tmp/profile")),
-            port: 29998,
-            timeout_secs: 60,
-            restart_running: true,
-        }
-    );
+    .unwrap_err();
+    assert!(error.contains("browser-session"));
 }
 
 #[test]
-fn parses_prepare_login_profile_command() {
-    let options = parse_args([
-        "auth",
-        "prepare-login-profile",
-        "--output",
-        "/tmp/auth.json",
-        "--browser",
-        "firefox",
-        "--profile-dir",
-        "/tmp/profile",
-        "--timeout-secs",
-        "60",
-    ])
-    .unwrap();
-    assert_eq!(
-        options.command,
-        Command::AuthPrepareLoginProfile {
-            output: PathBuf::from("/tmp/auth.json"),
-            browser: Some("firefox".to_string()),
-            profile_dir: Some(PathBuf::from("/tmp/profile")),
-            timeout_secs: 60,
-        }
-    );
+fn rejects_removed_browser_auth_actions() {
+    let error = parse_args(["auth", "login-window", "--output", "/tmp/auth.json"]).unwrap_err();
+    assert!(error.contains("unknown auth action"));
 }
 
 #[test]
@@ -422,15 +377,6 @@ fn error_envelope_preserves_explicit_error_metadata() {
     assert_eq!(network["error"]["code"], "network");
     assert_eq!(network["error"]["auth-required"], false);
     assert_eq!(network["error"]["retryable"], true);
-
-    let browser: Value =
-        serde_json::from_str(&encode_error(&HelperError::browser_restart_required(
-            "Zen is already running without WebDriver BiDi on 127.0.0.1:29317",
-        )))
-        .unwrap();
-    assert_eq!(browser["error"]["code"], "browser-restart-required");
-    assert_eq!(browser["error"]["auth-required"], false);
-    assert_eq!(browser["error"]["retryable"], false);
 }
 
 #[test]

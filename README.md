@@ -11,11 +11,11 @@ side-window and child-frame now-playing views. Terminal Emacs is supported
 through those Emacs surfaces; ytm-radio does not provide or target a standalone
 terminal TUI outside Emacs.
 
-YouTube Music account access is a separate Rust CLI. It is not an Emacs
-dynamic module and does not run as a resident service. Emacs starts one
-process for a request, reads a versioned JSON response, and the process exits.
-The helper also resolves authenticated account tracks before handing a direct
-audio stream to `mpv`.
+YouTube Music account access is a separate Rust CLI. Browser login capture is
+provided by the shared `browser-session` package. Neither is an Emacs dynamic
+module or a resident service. The ytm-radio helper maps a private browser
+capture directly to its provider auth file and resolves authenticated account
+tracks before handing a direct audio stream to `mpv`.
 
 ![ytm-radio Home view with the now-playing child frame](assets/ytm-radio-home-now-playing.jpg)
 
@@ -34,8 +34,7 @@ Implemented:
   side-window, or regular-buffer now-playing views;
 - expose current-track actions through a transient menu;
 - invoke an external Rust account helper;
-- import YouTube Music auth through a browser login window and the
-  browser's DevTools protocol;
+- import YouTube Music auth through the shared browser-session package;
 - make authenticated YouTube Music home, explore, library, liked, detail,
   search, radio/mix, playlist mutation, rating, track status, library
   mutation, item library, and subscription requests;
@@ -71,7 +70,8 @@ YouTube Music page instead of hardcoding the API key.
 - `transient`
 - `yt-dlp`
 - `mpv`
-- a Rust toolchain only when building the account helper locally
+- the `browser-session` Emacs package and its external helper
+- a Rust toolchain when building either helper locally
 
 No Python runtime or Python package is used.
 
@@ -90,10 +90,24 @@ Install the account helper from the latest GitHub release:
 M-x ytm-radio-install-helper
 ```
 
+Install `browser-session` as the package dependency and configure its helper.
+During development from sibling checkouts, build it with:
+
+```sh
+cargo build --manifest-path ../browser-session/Cargo.toml
+```
+
+Then point its Emacs client at the binary when necessary:
+
+```elisp
+(setq browser-session-helper-command
+      "/absolute/path/to/browser-session")
+```
+
 You can also just run `M-x ytm-radio`. When account-backed data is first needed
-and no helper is available, ytm-radio asks whether to download the matching
-helper release. Confirm the prompt to install the helper and continue the
-original action.
+and the ytm-radio helper is unavailable, ytm-radio asks whether to download the
+matching helper release. The browser-session helper has its own installation
+boundary and must be executable before login starts.
 
 Opening `M-x ytm-radio` does not prompt for a URL when the catalog is empty.
 When account access is needed, ytm-radio opens the login flow automatically.
@@ -200,8 +214,9 @@ diagnostic instead:
 ```
 
 Run `M-x ytm-radio-doctor` when playback, login import, or account browsing
-does not start. It reports whether the helper, `mpv`, `yt-dlp`, the runtime
-directory, and the auth file are visible from Emacs.
+does not start. It reports whether the ytm-radio helper, browser-session helper,
+`mpv`, `yt-dlp`, the runtime directory, and the auth file are visible from
+Emacs.
 
 ## Commands
 
@@ -324,8 +339,7 @@ The CLI surface is:
 
 ```text
 ytm-radio-helper auth check --auth FILE
-ytm-radio-helper auth prepare-login-profile --output FILE [--browser BROWSER] [--profile-dir DIR] [--timeout-secs N]
-ytm-radio-helper auth login-window --output FILE [--browser BROWSER] [--profile-dir DIR] [--port N] [--timeout-secs N] [--restart-running]
+ytm-radio-helper auth import-capture --capture FILE --output FILE
 ytm-radio-helper version
 ytm-radio-helper browse home --auth FILE [--limit N] [--initial-only]
 ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N]
@@ -388,7 +402,7 @@ Responses use a stable envelope:
   "ok": true,
   "schema": 1,
   "protocol": 1,
-  "helper-version": "0.1.10",
+  "helper-version": "0.1.11",
   "data": {
     "sources": []
   },
@@ -414,32 +428,34 @@ If the helper reports that an existing auth file is rejected, for example with
 HTTP 401 Unauthorized or HTTP 403 Forbidden, ytm-radio clears account-derived
 cache, opens the same login flow, and retries the original action after login.
 
-ytm-radio opens the login browser at `https://music.youtube.com`. Sign in there
-if needed. The helper waits for the logged-in YouTube Music page to expose
-cookies and page context, then writes the auth JSON.
+ytm-radio asks browser-session to open `https://music.youtube.com`. Sign in
+there if needed. browser-session captures the logged-in origin session and page
+context into a private temporary file. The ytm-radio helper validates and maps
+that file directly to its dedicated auth JSON, then consumes the temporary file.
 
 Google may reject credential entry inside a WebDriver-controlled window for a
 fresh Firefox or Zen isolated profile. Run `M-x ytm-radio-prepare-login` once
 in that case. It opens the same isolated profile without remote control. Sign
 in, confirm that YouTube Music has loaded, and close the isolated browser.
-ytm-radio then starts the normal WebDriver BiDi import automatically. The
-normal Firefox or Zen profile is not opened or modified. Repeat this preparation
-only if the isolated profile loses its Google session.
+ytm-radio then starts the normal browser-session WebDriver BiDi capture
+automatically. The normal Firefox or Zen profile is not opened or modified.
+Repeat this preparation only if the isolated profile loses its Google session.
 
 The login browser must be started with a local remote-control endpoint. If you
 opt into the browser's normal profile and that browser is already running
-without the endpoint, ytm-radio asks before restarting it once. Chrome uses a
-helper-managed non-default profile when needed to satisfy Chrome's DevTools
+without the endpoint, ytm-radio asks before restarting it once. browser-session
+uses a non-default Chrome profile when needed to satisfy Chrome's DevTools
 profile requirement.
 
 The login flow:
 
-1. opens the login browser with a local remote-control endpoint;
-2. waits for sign-in to finish;
-3. reads cookies and `ytcfg` page context through the browser protocol;
-4. writes a private JSON file with mode `0600` on Unix;
-5. clears the helper bootstrap and response caches;
-6. refreshes Home asynchronously.
+1. browser-session opens the login browser with a local remote-control endpoint;
+2. browser-session waits for sign-in and captures the YouTube Music origin
+   session plus provider-owned page context into a private `0600` file on Unix;
+3. the ytm-radio helper maps that capture to `auth.json` and removes the
+   temporary capture file;
+4. the helper clears bootstrap and response caches;
+5. ytm-radio refreshes Home asynchronously.
 
 The default output is:
 
@@ -457,8 +473,8 @@ and are cleared after login refresh. If default
 `~/.emacs.d/ytm-radio/auth.json` or `state.eld` files already exist from an
 older checkout, ytm-radio copies them into the new directory on first startup.
 
-By default, ytm-radio opens the system default browser when that browser has a
-supported login flow. Chromium-based browsers use the DevTools protocol;
+By default, browser-session opens the system default browser when that browser
+has a supported login flow. Chromium-based browsers use the DevTools protocol;
 Firefox and Zen use WebDriver BiDi. On macOS this uses the default application
 for `https://` URLs. On Linux this uses the default
 `x-scheme-handler/https` desktop entry.
@@ -469,15 +485,17 @@ Zen. Do not configure `cookies-from-browser` for normal Library, Home, Explore,
 Search, or detail-page playback.
 
 Set a preferred login browser when the default browser is unsupported or when
-you want a specific browser. Use `chrome`, `brave`, `edge`, `chromium`,
+you want a specific browser. These historical `ytm-radio-helper-login-*`
+options now configure browser-session. Use `chrome`, `brave`, `edge`, `chromium`,
 `firefox`, `zen`, `dia`, or an executable path:
 
 ```elisp
 (setq ytm-radio-helper-login-browser "chrome")
 ```
 
-By default, Chrome, Firefox, and Zen use isolated profiles next to the auth file
-when no explicit profile is configured. With the default auth file, those are
+By default, Chrome, Firefox, and Zen use browser-session isolated profiles
+below `ytm-radio-data-directory` when no explicit profile is configured. With
+the default data directory, those are
 `~/.ytm-radio/login-profile/`, `~/.ytm-radio/login-profile-firefox/`, and
 `~/.ytm-radio/login-profile-zen/`. Other supported browsers use their normal
 profile. Chrome 136 and newer do not enable DevTools for the default Chrome
@@ -489,14 +507,14 @@ browser, set:
       "~/.ytm-radio/custom-login-profile/")
 ```
 
-Set `ytm-radio-helper-login-profile-directory` to nil to use the helper's
+Set `ytm-radio-helper-login-profile-directory` to nil to use browser-session's
 browser-specific default behavior.
 
 Firefox and Zen are supported through WebDriver BiDi. Their automatic isolated
 profiles let ytm-radio start a separate login instance while the normal browser
-is running. The helper closes that separate instance after importing the login
-session. `M-x ytm-radio-prepare-login` initializes a fresh isolated profile in
-ordinary browser mode before the first automated import.
+is running. browser-session closes only the isolated instance it starts after
+capture. `M-x ytm-radio-prepare-login` initializes a fresh isolated profile in
+ordinary browser mode before the first automated capture.
 
 The default local browser remote-control port is `29317`:
 
@@ -543,15 +561,15 @@ The proxy is passed to the Rust helper, `yt-dlp`, and mpv's ytdl hook. HTTP and
 HTTPS proxy URLs are also used for Emacs cover downloads and passed to mpv for
 direct media URL playback.
 
-When ytm-radio starts a Chromium-compatible login browser, the helper also
-launches it with that proxy by passing a browser process argument. ytm-radio does
-not rewrite Firefox or Zen profile preferences for WebDriver BiDi login, and it
-does not alter already-running browser sessions. Firefox and Zen login windows
-and existing browser sessions must use the browser or system proxy
-configuration. When a SOCKS proxy is configured, ytm-radio avoids using cached
-direct media URLs because mpv's direct transport may not preserve SOCKS routing.
-Authenticated helper-backed playback requires a direct media URL and therefore
-currently requires no proxy or an HTTP/HTTPS proxy.
+When browser-session starts a Chromium-compatible login browser, it launches
+that browser with this proxy. ytm-radio does not rewrite Firefox or Zen profile
+preferences for WebDriver BiDi login, and browser-session does not alter
+already-running browser sessions. Firefox and Zen login windows and existing
+browser sessions must use the browser or system proxy configuration. When a
+SOCKS proxy is configured, ytm-radio avoids using cached direct media URLs
+because mpv's direct transport may not preserve SOCKS routing. Authenticated
+helper-backed playback requires a direct media URL and therefore currently
+requires no proxy or an HTTP/HTTPS proxy.
 
 ## Transient URL Cookies
 

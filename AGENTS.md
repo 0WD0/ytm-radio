@@ -105,15 +105,17 @@ repository. It is adapted from `~/repos/coding-guidelines/general.md` and
 
 - Do not implement YouTube or YouTube Music reverse-engineering in Elisp.
   Treat `yt-dlp` and the Rust helper as compatibility boundaries.
-- Account access belongs in the external Rust CLI under `helper/`. Do not add
-  a Python helper or an Emacs dynamic module.
+- YouTube Music account access and provider-specific auth mapping belong in the
+  external Rust CLI under `helper/`. Generic browser capture belongs in the
+  `browser-session` dependency. Do not add a Python helper or an Emacs dynamic
+  module.
 - Keep the helper short-lived by default: one command reads configuration,
   writes one JSON response to stdout, and exits.
-- The supported account-auth workflow is a browser login window driven by
-  `auth login-window` through Chromium DevTools or Firefox-family WebDriver
-  BiDi. Do not add browser-cookie database import, copied-header import,
-  Dia-specific restart commands, or other fallback auth paths unless the
-  product decision changes.
+- The supported account-auth workflow is a browser-session login capture through
+  Chromium DevTools or Firefox-family WebDriver BiDi, followed by the ytm helper
+  `auth import-capture` mapping step. Do not add browser-cookie database import,
+  copied-header import, Dia-specific restart commands, or other fallback auth
+  paths unless the product decision changes.
 - Do not duplicate browser-specific cookie database crypto in Rust.
 - Version the helper JSON envelope. Emacs must reject unsupported schema
   versions instead of guessing.

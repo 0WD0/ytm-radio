@@ -36,8 +36,8 @@ and useful.
 - Treat the currently playing track as a first-class action target, separate
   from browser point, so account actions and local queue actions remain
   predictable when point is on a search result, section, album, or artist.
-- Keep account access short-lived and outside Elisp, while making the browser
-  login handoff automatic when account-backed views require it.
+- Keep ytm-radio account access short-lived and outside Elisp, while making the
+  browser login handoff automatic when account-backed views require it.
 
 ## Non-goals
 
@@ -115,30 +115,30 @@ and useful.
   commands, and mpv IPC.
 - `yt-dlp` owns URL metadata discovery and media extraction compatibility.
   Transient URLs use mpv's ytdl path; helper-backed account tracks are resolved
-  by the Rust helper with the existing browser-login session before mpv starts.
-- The Rust helper owns YouTube Music account requests, account mutations, the
-  browser login window, authenticated account stream resolution, and helper
-  JSON envelopes. Elisp may choose targets and update local display state, but
-  it must not persist cookies, YouTube Music feedback tokens, or duplicate
-  Innertube request assembly.
-- The browser login window may use Chromium DevTools or WebDriver BiDi for
-  Firefox-family browsers, including Firefox and Zen. It must not read browser
-  cookie databases directly.
-- Firefox-family login must provide an explicit profile-preparation command
-  that opens the isolated profile without WebDriver, waits for the user to
-  close it, and then imports the prepared session through the normal BiDi path.
-  It must not hide automation from Google or copy session data from a normal
-  browser profile.
+  by the Rust helper with the imported browser-session auth file before mpv starts.
+- The Rust helper owns YouTube Music account requests, account mutations,
+  provider-specific capture validation and auth-file mapping, authenticated
+  account stream resolution, and helper JSON envelopes. Elisp may choose
+  targets and update local display state, but it must not persist cookies,
+  YouTube Music feedback tokens, or duplicate Innertube request assembly.
+- The browser-session package owns browser discovery, login-window lifecycle,
+  Chromium DevTools and Firefox-family WebDriver BiDi capture, and private
+  capture files. It must not read browser cookie databases directly.
+- Firefox-family login must provide an explicit browser-session profile-
+  preparation command that opens the isolated profile without WebDriver, waits
+  for the user to close it, and then performs the normal BiDi capture. It must
+  not hide automation from Google or copy session data from a normal browser
+  profile.
 - The helper may be built locally during development or installed as a
   platform-specific release binary. Emacs may download that binary through an
   explicit user command, but it must not silently download executable code while
   opening or browsing.
 - A single optional proxy URL may be applied to helper account requests,
   `yt-dlp` discovery and prefetching, cover image downloads, and mpv playback
-  paths. When the helper starts a Chromium-compatible login browser, the proxy
-  is applied to that browser launch. Firefox and Zen WebDriver BiDi logins use
-  helper-managed isolated profiles by default so remote-control preferences do
-  not affect normal browser profiles or already-running sessions; those paths
+  paths. When browser-session starts a Chromium-compatible login browser, the
+  proxy is applied to that browser launch. Firefox and Zen WebDriver BiDi logins
+  use browser-session isolated profiles by default so remote-control preferences
+  do not affect normal browser profiles or already-running sessions; those paths
   use browser or system proxy configuration.
 - Helper stdout must remain machine-readable JSON; diagnostics belong on
   stderr.

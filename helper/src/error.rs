@@ -17,10 +17,6 @@ impl HelperError {
         Self::new("auth-required", message, false, true)
     }
 
-    pub fn browser_restart_required(message: impl Into<String>) -> Self {
-        Self::new("browser-restart-required", message, false, false)
-    }
-
     pub fn network(message: impl Into<String>) -> Self {
         Self::new("network", message, true, false)
     }

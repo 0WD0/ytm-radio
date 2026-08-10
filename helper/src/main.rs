@@ -5,7 +5,7 @@ mod error;
 mod playback;
 mod ytmusic;
 
-use auth::{login_window, prepare_login_profile, AuthConfig};
+use auth::{import_capture, AuthConfig};
 use error::HelperError;
 use playback::resolve_stream;
 use serde::Serialize;
@@ -15,7 +15,6 @@ use serde_json::Value;
 use std::env;
 use std::path::PathBuf;
 use std::process;
-use std::time::Duration;
 use ytmusic::{
     add_to_playlist, bootstrap_cache_path, browse, browse_id as browse_detail, clear_account_cache,
     clear_response_cache, continuation, item_library, library, playlist_options, radio, rate,
@@ -25,27 +24,14 @@ use ytmusic::{
 const SCHEMA_VERSION: u32 = 1;
 const HELPER_PROTOCOL_VERSION: u32 = 1;
 const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_LOGIN_CDP_PORT: u16 = 29317;
-const DEFAULT_LOGIN_TIMEOUT_SECS: u64 = 180;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Help,
     Version,
     AuthCheck,
-    AuthPrepareLoginProfile {
+    AuthImportCapture {
+        capture: PathBuf,
         output: PathBuf,
-        browser: Option<String>,
-        profile_dir: Option<PathBuf>,
-        timeout_secs: u64,
-    },
-    AuthLoginWindow {
-        output: PathBuf,
-        browser: Option<String>,
-        profile_dir: Option<PathBuf>,
-        port: u16,
-        timeout_secs: u64,
-        restart_running: bool,
     },
     Browse(BrowseTarget),
     BrowseId {
@@ -211,43 +197,8 @@ where
                 }
             })
         }
-        Command::AuthPrepareLoginProfile {
-            output,
-            browser,
-            profile_dir,
-            timeout_secs,
-        } => {
-            let prepared = prepare_login_profile(
-                output,
-                browser.as_deref(),
-                profile_dir.as_deref(),
-                Duration::from_secs(*timeout_secs),
-            )?;
-            json!({
-                "profile": {
-                    "prepared": true,
-                    "browser": prepared.browser,
-                    "path": prepared.path
-                }
-            })
-        }
-        Command::AuthLoginWindow {
-            output,
-            browser,
-            profile_dir,
-            port,
-            timeout_secs,
-            restart_running,
-        } => {
-            let config = login_window(
-                output,
-                browser.as_deref(),
-                profile_dir.as_deref(),
-                *port,
-                Duration::from_secs(*timeout_secs),
-                *restart_running,
-                proxy,
-            )?;
+        Command::AuthImportCapture { capture, output } => {
+            let config = import_capture(capture, output)?;
             if let Err(error) = clear_account_cache(&bootstrap_cache_path(output)) {
                 eprintln!("ytm-radio-helper cache-invalidation-error={error}");
             }
@@ -255,8 +206,7 @@ where
                 "auth": {
                     "configured": true,
                     "source": config.source,
-                    "path": output,
-                    "profile": profile_dir
+                    "path": output
                 }
             })
         }
@@ -497,19 +447,16 @@ where
 
     let mut auth_file = None;
     let mut limit = 100;
+    let mut limit_specified = false;
     #[cfg(any(test, debug_assertions))]
     let mut mock_data = false;
     #[cfg(not(any(test, debug_assertions)))]
     let mock_data = false;
-    let mut browser = None;
     let mut output = None;
-    let mut port = None;
-    let mut profile_dir = None;
+    let mut capture = None;
     let mut browse_params = None;
     let mut initial_only = false;
     let mut fresh = false;
-    let mut timeout_secs = None;
-    let mut restart_running = false;
     let mut proxy = None;
     let mut yt_dlp_program = None;
     let mut stream_format = None;
@@ -518,6 +465,7 @@ where
         match args[index].as_str() {
             "--auth" => auth_file = Some(PathBuf::from(option_value(&args, &mut index)?)),
             "--limit" => {
+                limit_specified = true;
                 let value = option_value(&args, &mut index)?;
                 limit = value
                     .parse::<usize>()
@@ -528,25 +476,8 @@ where
             }
             #[cfg(any(test, debug_assertions))]
             "--mock" => mock_data = true,
-            "--browser" => browser = Some(option_value(&args, &mut index)?.to_string()),
             "--output" => output = Some(PathBuf::from(option_value(&args, &mut index)?)),
-            "--port" => {
-                let value = option_value(&args, &mut index)?;
-                port = Some(
-                    value
-                        .parse::<u16>()
-                        .map_err(|_| format!("invalid port `{value}`"))?,
-                );
-            }
-            "--profile-dir" => profile_dir = Some(PathBuf::from(option_value(&args, &mut index)?)),
-            "--timeout-secs" => {
-                let value = option_value(&args, &mut index)?;
-                timeout_secs = Some(
-                    value
-                        .parse::<u64>()
-                        .map_err(|_| format!("invalid timeout `{value}`"))?,
-                );
-            }
+            "--capture" => capture = Some(PathBuf::from(option_value(&args, &mut index)?)),
             "--params" => {
                 let value = option_value(&args, &mut index)?;
                 if value.trim().is_empty() {
@@ -556,7 +487,6 @@ where
             }
             "--initial-only" => initial_only = true,
             "--fresh" => fresh = true,
-            "--restart-running" => restart_running = true,
             "--proxy" => {
                 let value = option_value(&args, &mut index)?.trim();
                 if value.is_empty() {
@@ -578,6 +508,9 @@ where
                 }
                 stream_format = Some(value.to_string());
             }
+            "--browser" | "--port" | "--profile-dir" | "--timeout-secs" | "--restart-running" => {
+                return Err("browser options are owned by browser-session".to_string());
+            }
             other => return Err(format!("unknown option `{other}`")),
         }
         index += 1;
@@ -588,49 +521,29 @@ where
     {
         return Err("stream options require a stream action".to_string());
     }
+    if capture.is_some() && !matches!(&command, Command::AuthImportCapture { .. }) {
+        return Err("capture options require auth import-capture".to_string());
+    }
 
     let command = match command {
-        Command::AuthPrepareLoginProfile { .. } => {
-            if browse_params.is_some() || initial_only || fresh || mock_data || auth_file.is_some()
+        Command::AuthImportCapture { .. } => {
+            if limit_specified
+                || proxy.is_some()
+                || browse_params.is_some()
+                || initial_only
+                || fresh
+                || mock_data
+                || auth_file.is_some()
             {
-                return Err("browse options require a browse action".to_string());
+                return Err("capture import accepts only capture and output options".to_string());
             }
-            if port.is_some() || restart_running || proxy.is_some() {
-                return Err(
-                    "login profile preparation accepts only output, browser, profile, and timeout options"
-                        .to_string(),
-                );
-            }
+            let capture = capture.ok_or_else(|| "missing --capture FILE".to_string())?;
             let output = output.ok_or_else(|| "missing --output FILE".to_string())?;
-            Command::AuthPrepareLoginProfile {
-                output,
-                browser,
-                profile_dir,
-                timeout_secs: timeout_secs.unwrap_or(DEFAULT_LOGIN_TIMEOUT_SECS),
-            }
-        }
-        Command::AuthLoginWindow { .. } => {
-            if browse_params.is_some() || initial_only || fresh || mock_data || auth_file.is_some()
-            {
-                return Err("browse options require a browse action".to_string());
-            }
-            let output = output.ok_or_else(|| "missing --output FILE".to_string())?;
-            Command::AuthLoginWindow {
-                output,
-                browser,
-                profile_dir,
-                port: port.unwrap_or(DEFAULT_LOGIN_CDP_PORT),
-                timeout_secs: timeout_secs.unwrap_or(DEFAULT_LOGIN_TIMEOUT_SECS),
-                restart_running,
-            }
+            Command::AuthImportCapture { capture, output }
         }
         Command::Version => {
-            if browser.is_some()
+            if limit_specified
                 || output.is_some()
-                || port.is_some()
-                || profile_dir.is_some()
-                || timeout_secs.is_some()
-                || restart_running
                 || browse_params.is_some()
                 || initial_only
                 || fresh
@@ -643,14 +556,7 @@ where
             Command::Version
         }
         Command::BrowseId { browse_id, .. } => {
-            if browser.is_some()
-                || output.is_some()
-                || port.is_some()
-                || profile_dir.is_some()
-                || timeout_secs.is_some()
-                || initial_only
-                || restart_running
-            {
+            if output.is_some() || initial_only {
                 return Err("auth options require an auth action".to_string());
             }
             Command::BrowseId {
@@ -661,14 +567,7 @@ where
         Command::ItemLibrary {
             browse_id, action, ..
         } => {
-            if browser.is_some()
-                || output.is_some()
-                || port.is_some()
-                || profile_dir.is_some()
-                || timeout_secs.is_some()
-                || initial_only
-                || restart_running
-            {
+            if output.is_some() || initial_only {
                 return Err("auth options require an auth action".to_string());
             }
             Command::ItemLibrary {
@@ -680,14 +579,7 @@ where
         Command::Subscription {
             browse_id, action, ..
         } => {
-            if browser.is_some()
-                || output.is_some()
-                || port.is_some()
-                || profile_dir.is_some()
-                || timeout_secs.is_some()
-                || initial_only
-                || restart_running
-            {
+            if output.is_some() || initial_only {
                 return Err("auth options require an auth action".to_string());
             }
             Command::Subscription {
@@ -697,14 +589,7 @@ where
             }
         }
         Command::Browse(target) => {
-            if browser.is_some()
-                || output.is_some()
-                || port.is_some()
-                || profile_dir.is_some()
-                || timeout_secs.is_some()
-                || browse_params.is_some()
-                || restart_running
-            {
+            if output.is_some() || browse_params.is_some() {
                 return Err("auth options require an auth action".to_string());
             }
             if initial_only && !matches!(target, BrowseTarget::Home) {
@@ -716,13 +601,7 @@ where
             if proxy.is_some() {
                 return Err("proxy options require a YouTube Music request action".to_string());
             }
-            if browser.is_some()
-                || output.is_some()
-                || port.is_some()
-                || profile_dir.is_some()
-                || timeout_secs.is_some()
-                || restart_running
-            {
+            if output.is_some() {
                 return Err("auth options require an auth action".to_string());
             }
             if browse_params.is_some() || initial_only || fresh || mock_data {
@@ -731,16 +610,7 @@ where
             Command::AuthCheck
         }
         Command::Stream { video_id, .. } => {
-            if browser.is_some()
-                || output.is_some()
-                || port.is_some()
-                || profile_dir.is_some()
-                || timeout_secs.is_some()
-                || browse_params.is_some()
-                || initial_only
-                || fresh
-                || restart_running
-            {
+            if output.is_some() || browse_params.is_some() || initial_only || fresh {
                 return Err("stream accepts only auth, proxy, and yt-dlp options".to_string());
             }
             Command::Stream {
@@ -750,15 +620,7 @@ where
             }
         }
         other => {
-            if browser.is_some()
-                || output.is_some()
-                || port.is_some()
-                || profile_dir.is_some()
-                || timeout_secs.is_some()
-                || browse_params.is_some()
-                || initial_only
-                || restart_running
-            {
+            if output.is_some() || browse_params.is_some() || initial_only {
                 return Err("auth options require an auth action".to_string());
             }
             other
@@ -783,19 +645,9 @@ fn parse_auth_command(args: &mut Vec<String>) -> Result<Command, String> {
     args.remove(0);
     match action.as_str() {
         "check" => Ok(Command::AuthCheck),
-        "prepare-login-profile" => Ok(Command::AuthPrepareLoginProfile {
+        "import-capture" => Ok(Command::AuthImportCapture {
+            capture: PathBuf::new(),
             output: PathBuf::new(),
-            browser: None,
-            profile_dir: None,
-            timeout_secs: DEFAULT_LOGIN_TIMEOUT_SECS,
-        }),
-        "login-window" => Ok(Command::AuthLoginWindow {
-            output: PathBuf::new(),
-            browser: None,
-            profile_dir: None,
-            port: DEFAULT_LOGIN_CDP_PORT,
-            timeout_secs: DEFAULT_LOGIN_TIMEOUT_SECS,
-            restart_running: false,
         }),
         other => Err(format!("unknown auth action `{other}`")),
     }
@@ -984,8 +836,7 @@ fn usage() -> String {
         "usage:",
         "  ytm-radio-helper version",
         "  ytm-radio-helper auth check --auth FILE",
-        "  ytm-radio-helper auth prepare-login-profile --output FILE [--browser BROWSER] [--profile-dir DIR] [--timeout-secs N]",
-        "  ytm-radio-helper auth login-window --output FILE [--browser BROWSER] [--profile-dir DIR] [--port N] [--timeout-secs N] [--restart-running] [--proxy URL]",
+        "  ytm-radio-helper auth import-capture --capture FILE --output FILE",
         "  ytm-radio-helper browse home --auth FILE [--limit N] [--initial-only] [--fresh]",
         "  ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N] [--fresh]",
         "  ytm-radio-helper browse-id BROWSE_ID --auth FILE [--params PARAMS] [--limit N] [--fresh]",
@@ -1002,7 +853,7 @@ fn usage() -> String {
         "  ytm-radio-helper stream VIDEO_ID --auth FILE [--yt-dlp-program PROGRAM] [--format FORMAT] [--proxy URL]",
         "",
         "options:",
-        "  --proxy URL  proxy YouTube Music requests and supported login browsers",
+        "  --proxy URL  proxy YouTube Music requests",
     ]
     .join("\n")
 }

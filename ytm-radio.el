@@ -2,8 +2,8 @@
 
 ;; Author: Lucius Chen
 ;; URL: https://github.com/luciuschen/ytm-radio
-;; Version: 0.1.10
-;; Package-Requires: ((emacs "29.1") (transient "0.3.7"))
+;; Version: 0.1.11
+;; Package-Requires: ((emacs "29.1") (browser-session "0.1.0") (transient "0.3.7"))
 ;; Keywords: multimedia
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 ;; Assisted-by: OpenAI Codex
@@ -16,6 +16,7 @@
 ;;; Code:
 
 (require 'button)
+(require 'browser-session)
 (require 'cl-lib)
 (require 'imenu)
 (require 'json)
@@ -47,6 +48,12 @@
                     ytm-radio--directory)
   "Default in-repository helper executable path.")
 
+(defconst ytm-radio--music-origin "https://music.youtube.com"
+  "YouTube Music origin used for browser-session capture.")
+
+(defconst ytm-radio--session-script-name "ytm-radio-session.js"
+  "Provider-owned page script file name for YouTube Music session capture.")
+
 (defconst ytm-radio--state-version 1
   "Current durable state file version.")
 
@@ -56,7 +63,7 @@
 (defconst ytm-radio--helper-protocol-version 1
   "Supported helper protocol version.")
 
-(defconst ytm-radio--helper-version "0.1.10"
+(defconst ytm-radio--helper-version "0.1.11"
   "Helper binary version expected by this Elisp package.")
 
 ;;; Customization
@@ -195,8 +202,8 @@ example \"cookies-from-browser=chrome\"."
 When non-nil, this is passed to yt-dlp, mpv's ytdl hook, and the Rust helper.
 HTTP and HTTPS proxy URLs are also passed to cover downloads and mpv's direct
 media transport.
-When the helper starts a Chromium-compatible login browser, it also passes this
-proxy to that browser."
+When browser-session starts a Chromium-compatible login browser, it also passes
+this proxy to that browser."
   :type '(choice (const :tag "No proxy" nil)
                  string)
   :group 'ytm-radio)
@@ -239,9 +246,8 @@ The file contents are never persisted in ytm-radio state."
 
 (defcustom ytm-radio-helper-login-browser nil
   "Browser executable or known browser name used for account login.
-When nil, the helper uses the system default browser when it supports a
-known login flow.  Chromium-based browsers use DevTools; Firefox and Zen use
-WebDriver BiDi."
+When nil, browser-session uses the system default supported browser.
+Chromium-based browsers use DevTools; Firefox and Zen use WebDriver BiDi."
   :type '(choice (const :tag "Auto" nil)
                  string)
   :group 'ytm-radio)
@@ -249,14 +255,16 @@ WebDriver BiDi."
 (defcustom ytm-radio-helper-login-profile-directory
   nil
   "Optional isolated browser profile directory used for account login.
-When nil, the helper uses browser-specific defaults.  Chrome, Firefox, and Zen
-use helper-managed non-default profiles for their remote-control login flows."
-  :type '(choice (const :tag "Use helper/browser default profile" nil)
+When nil, browser-session chooses browser-specific defaults below
+`ytm-radio-data-directory'.  Chrome, Firefox, and Zen use non-default profiles
+for their remote-control login flows."
+  :type '(choice (const :tag "Use browser-session default profile" nil)
                  directory)
   :group 'ytm-radio)
 
 (defcustom ytm-radio-helper-login-cdp-port 29317
-  "Local browser remote-control port used for account login."
+  "Local browser remote-control port used for account login.
+The port is passed to browser-session."
   :type '(restricted-sexp
           :match-alternatives
           ((lambda (value)
@@ -691,7 +699,7 @@ stored in `ytm-radio-state-file'."
   "Current asynchronous URL import process.")
 
 (defvar ytm-radio--login-process nil
-  "Current asynchronous YouTube Music login helper process.")
+  "Current asynchronous YouTube Music login process.")
 
 (defvar ytm-radio--login-continuation nil
   "Action to run after the current YouTube Music login succeeds.")
@@ -1227,6 +1235,8 @@ prompting."
     "ytm-radio doctor"
     ""
     (ytm-radio--doctor-program-line "helper" (ytm-radio--helper-command))
+    (ytm-radio--doctor-program-line "browser-session"
+                                    browser-session-helper-command)
     (ytm-radio--doctor-helper-version-line)
     (ytm-radio--doctor-program-line "mpv" ytm-radio-mpv-program)
     (ytm-radio--doctor-program-line "yt-dlp" ytm-radio-yt-dlp-program)
@@ -1705,46 +1715,65 @@ When FRESH is non-nil, bypass cached helper responses."
             (list "--format" ytm-radio-mpv-ytdl-format))
           (ytm-radio--helper-shared-arguments)))
 
-(defun ytm-radio--helper-login-browser-arguments ()
-  "Return explicitly configured login browser and profile arguments."
-  (append
-   (when (and (stringp ytm-radio-helper-login-profile-directory)
-              (not (string-empty-p ytm-radio-helper-login-profile-directory)))
-     (list "--profile-dir"
-           (expand-file-name ytm-radio-helper-login-profile-directory)))
-   (when (and (stringp ytm-radio-helper-login-browser)
-              (not (string-empty-p ytm-radio-helper-login-browser)))
-     (list "--browser" ytm-radio-helper-login-browser))))
+(defun ytm-radio--configured-login-browser ()
+  "Return the configured account-login browser, or nil."
+  (when (and (stringp ytm-radio-helper-login-browser)
+             (not (string-empty-p ytm-radio-helper-login-browser)))
+    ytm-radio-helper-login-browser))
 
-(defun ytm-radio--helper-login-arguments (output &optional restart-running)
-  "Return helper arguments for logging in and writing auth to OUTPUT.
-When RESTART-RUNNING is non-nil, ask the helper to restart a running browser
-that does not expose DevTools."
-  (append
-   (list "auth"
-         "login-window"
-         "--output"
-         (expand-file-name output)
-         "--port"
-         (number-to-string ytm-radio-helper-login-cdp-port)
-         "--timeout-secs"
-         (number-to-string ytm-radio-helper-login-timeout))
-   (when-let* ((proxy (ytm-radio--proxy-url)))
-     (list "--proxy" proxy))
-   (when restart-running
-     (list "--restart-running"))
-   (ytm-radio--helper-login-browser-arguments)))
+(defun ytm-radio--configured-login-profile-directory ()
+  "Return the configured account-login profile directory, or nil."
+  (when (and (stringp ytm-radio-helper-login-profile-directory)
+             (not (string-empty-p ytm-radio-helper-login-profile-directory)))
+    (expand-file-name ytm-radio-helper-login-profile-directory)))
 
-(defun ytm-radio--helper-prepare-login-arguments (output)
-  "Return helper arguments for preparing an isolated profile beside OUTPUT."
-  (append
-   (list "auth"
-         "prepare-login-profile"
-         "--output"
-         (expand-file-name output)
-         "--timeout-secs"
-         (number-to-string ytm-radio-helper-login-timeout))
-   (ytm-radio--helper-login-browser-arguments)))
+(defun ytm-radio--browser-session-profile-root ()
+  "Return the automatic browser-session profile root, or nil.
+An explicit `ytm-radio-helper-login-profile-directory' takes precedence."
+  (unless (ytm-radio--configured-login-profile-directory)
+    (expand-file-name ytm-radio-data-directory)))
+
+(defun ytm-radio--browser-session-script-file ()
+  "Return the readable provider-owned YouTube Music session script file.
+
+A straight build can retain a symlink to the source `.el' file while omitting
+non-Elisp package files.  In that case, use the script beside that source file.
+A normal package installation uses the script copied beside the loaded file."
+  (let* ((loaded-script
+          (expand-file-name ytm-radio--session-script-name ytm-radio--directory))
+         (loaded-el (expand-file-name "ytm-radio.el" ytm-radio--directory))
+         (source-script
+          (when (file-exists-p loaded-el)
+            (expand-file-name
+             ytm-radio--session-script-name
+             (file-name-directory (file-truename loaded-el)))))
+         (candidates (delete-dups (delq nil (list loaded-script source-script)))))
+    (or (cl-find-if #'file-readable-p candidates)
+        (user-error "YouTube Music session script is not readable: %s"
+                    (string-join candidates ", ")))))
+
+(defun ytm-radio--browser-session-capture-file ()
+  "Create and return a private temporary browser-session capture file."
+  (let ((directory (expand-file-name ytm-radio-data-directory)))
+    (make-directory directory t)
+    (make-temp-file (expand-file-name ".browser-session-" directory)
+                    nil
+                    ".json")))
+
+(defun ytm-radio--delete-browser-session-capture (file)
+  "Delete private browser-session capture FILE when it remains on disk."
+  (when (and (stringp file) (file-exists-p file))
+    (ignore-errors
+      (delete-file file))))
+
+(defun ytm-radio--helper-import-capture-arguments (capture output)
+  "Return helper arguments for importing CAPTURE into auth OUTPUT."
+  (list "auth"
+        "import-capture"
+        "--capture"
+        (expand-file-name capture)
+        "--output"
+        (expand-file-name output)))
 
 (defun ytm-radio--call-helper-async (arguments success error-callback)
   "Run the external helper with ARGUMENTS asynchronously.
@@ -7261,48 +7290,114 @@ FOCUS is accepted for compatibility; child frames stay non-focusable."
   (interactive (list (read-string "YouTube Music search: ")))
   (ytm-radio--start-search-load query))
 
-(defun ytm-radio--login-restart-needed-p (helper-error)
-  "Return non-nil when HELPER-ERROR means the login browser needs restart."
-  (and (listp helper-error)
-       (equal (map-elt helper-error 'code) "browser-restart-required")))
+(defun ytm-radio--login-restart-needed-p (error)
+  "Return non-nil when ERROR means the login browser needs restart."
+  (and (listp error)
+       (equal (map-elt error 'code) "browser-restart-required")))
+
+(defun ytm-radio--finish-login (output)
+  "Finish successful account login written to OUTPUT."
+  (setq ytm-radio--login-process nil
+        ytm-radio-helper-auth-file (expand-file-name output)
+        ytm-radio--initial-home-refreshed nil)
+  (ytm-radio--set-home-continuation nil)
+  (ytm-radio--set-login-status nil)
+  (ytm-radio--drop-account-helper-sources)
+  (ytm-radio--save)
+  (if-let* ((continuation ytm-radio--login-continuation))
+      (progn
+        (setq ytm-radio--login-continuation nil)
+        (funcall continuation))
+    (ytm-radio--set-browser-view 'home t)
+    (ytm-radio--start-home-load))
+  (message "YouTube Music login imported"))
+
+(defun ytm-radio--finish-login-import-error (capture-file diagnostic)
+  "Finish a failed import of CAPTURE-FILE with DIAGNOSTIC."
+  (ytm-radio--delete-browser-session-capture capture-file)
+  (setq ytm-radio--login-process nil
+        ytm-radio--login-continuation nil)
+  (ytm-radio--set-login-status nil)
+  (message "%s" (ytm-radio--helper-error-message diagnostic)))
+
+(defun ytm-radio--start-login-import (capture-file output)
+  "Import private browser-session CAPTURE-FILE into auth OUTPUT."
+  (condition-case error
+      (setq
+       ytm-radio--login-process
+       (ytm-radio--call-helper-async
+        (ytm-radio--helper-import-capture-arguments capture-file output)
+        (lambda (_data)
+          (ytm-radio--delete-browser-session-capture capture-file)
+          (ytm-radio--finish-login output))
+        (lambda (diagnostic)
+          (ytm-radio--finish-login-import-error capture-file diagnostic))))
+    (error
+     (ytm-radio--delete-browser-session-capture capture-file)
+     (setq ytm-radio--login-process nil
+           ytm-radio--login-continuation nil)
+     (ytm-radio--set-login-status nil)
+     (signal (car error) (cdr error)))))
+
+(defun ytm-radio--finish-browser-session-login-error
+    (capture-file output restart-running after-success error)
+  "Handle browser-session ERROR while capturing CAPTURE-FILE for OUTPUT.
+When RESTART-RUNNING is nil, retry once through AFTER-SUCCESS after explicit
+restart confirmation."
+  (ytm-radio--delete-browser-session-capture capture-file)
+  (setq ytm-radio--login-process nil)
+  (ytm-radio--set-login-status nil)
+  (if (and (not restart-running)
+           (ytm-radio--login-restart-needed-p error)
+           (yes-or-no-p "Restart the login browser once to enable import? "))
+      (ytm-radio--start-login output t after-success)
+    (setq ytm-radio--login-continuation nil)
+    (message "Browser session failed: %s" (browser-session-error-message error))))
 
 (defun ytm-radio--start-login (output &optional restart-running after-success)
-  "Start asynchronous login into OUTPUT.
-When RESTART-RUNNING is non-nil, allow the helper to restart the browser.
-When AFTER-SUCCESS is non-nil, call it after importing auth."
+  "Start asynchronous browser-session login into OUTPUT.
+When RESTART-RUNNING is non-nil, permit one supported browser restart.  When
+AFTER-SUCCESS is non-nil, call it after importing the provider auth file."
   (when after-success
     (setq ytm-radio--login-continuation after-success))
-  (message "Opening YouTube Music login window...")
-  (ytm-radio--set-login-status "Login waiting in browser...")
-  (setq
-   ytm-radio--login-process
-   (ytm-radio--call-helper-async
-    (ytm-radio--helper-login-arguments output restart-running)
-    (lambda (_data)
-     (setq ytm-radio--login-process nil
-            ytm-radio-helper-auth-file (expand-file-name output)
-            ytm-radio--initial-home-refreshed nil)
-      (ytm-radio--set-home-continuation nil)
-      (ytm-radio--set-login-status nil)
-      (ytm-radio--drop-account-helper-sources)
-      (ytm-radio--save)
-      (if-let* ((continuation ytm-radio--login-continuation))
-          (progn
-            (setq ytm-radio--login-continuation nil)
-            (funcall continuation))
-        (ytm-radio--set-browser-view 'home t)
-        (ytm-radio--start-home-load))
-      (message "YouTube Music login imported"))
-    (lambda (diagnostic)
-      (setq ytm-radio--login-process nil)
-      (ytm-radio--set-login-status nil)
-      (if (and (not restart-running)
-               (ytm-radio--login-restart-needed-p diagnostic)
-               (yes-or-no-p
-                "Restart the login browser once to enable import? "))
-          (ytm-radio--start-login output t after-success)
-        (setq ytm-radio--login-continuation nil)
-        (message "%s" (ytm-radio--helper-error-message diagnostic)))))))
+  (let* ((script-file (ytm-radio--browser-session-script-file))
+         (capture-file (ytm-radio--browser-session-capture-file))
+         (browser (ytm-radio--configured-login-browser))
+         (profile-directory (ytm-radio--configured-login-profile-directory))
+         (profile-root (ytm-radio--browser-session-profile-root)))
+    (message "Opening YouTube Music login window...")
+    (ytm-radio--set-login-status "Login waiting in browser...")
+    (condition-case error
+        (setq
+         ytm-radio--login-process
+         (let ((browser-session-browser nil)
+               (browser-session-profile-directory nil)
+               (browser-session-profile-root nil)
+               (browser-session-cdp-port ytm-radio-helper-login-cdp-port)
+               (browser-session-timeout ytm-radio-helper-login-timeout)
+               (browser-session-proxy (ytm-radio--proxy-url)))
+           (browser-session-capture
+            :url ytm-radio--music-origin
+            :any-cookies '("__Secure-3PAPISID" "SAPISID")
+            :all-origin-cookies t
+            :output-file capture-file
+            :browser browser
+            :profile-directory profile-directory
+            :profile-root profile-root
+            :script-file script-file
+            :restart-running restart-running
+            :callback (lambda (_metadata)
+                        (ytm-radio--start-login-import capture-file output))
+            :errorback
+            (lambda (browser-error)
+              (ytm-radio--finish-browser-session-login-error
+               capture-file output restart-running after-success browser-error)))))
+      (error
+       (ytm-radio--delete-browser-session-capture capture-file)
+       (setq ytm-radio--login-process nil
+             ytm-radio--login-continuation nil)
+       (ytm-radio--set-login-status nil)
+       (signal (car error) (cdr error))))))
 
 ;;;###autoload
 (defun ytm-radio-prepare-login ()
@@ -7310,23 +7405,39 @@ When AFTER-SUCCESS is non-nil, call it after importing auth."
   (interactive)
   (when (process-live-p ytm-radio--login-process)
     (user-error "YouTube Music login is already running"))
-  (let ((output (expand-file-name ytm-radio-helper-auth-file)))
+  (let ((output (expand-file-name ytm-radio-helper-auth-file))
+        (browser (ytm-radio--configured-login-browser))
+        (profile-directory (ytm-radio--configured-login-profile-directory))
+        (profile-root (ytm-radio--browser-session-profile-root)))
     (message "Sign in to YouTube Music, then close the isolated browser...")
     (ytm-radio--set-login-status
      "Sign in, then close the isolated login browser...")
-    (setq
-     ytm-radio--login-process
-     (ytm-radio--call-helper-async
-      (ytm-radio--helper-prepare-login-arguments output)
-      (lambda (_data)
-        (setq ytm-radio--login-process nil)
-        (ytm-radio--set-login-status nil)
-        (message "Login profile prepared; importing account session...")
-        (ytm-radio--start-login output))
-      (lambda (diagnostic)
-        (setq ytm-radio--login-process nil)
-        (ytm-radio--set-login-status nil)
-        (message "%s" (ytm-radio--helper-error-message diagnostic)))))))
+    (condition-case error
+        (setq
+         ytm-radio--login-process
+         (let ((browser-session-browser nil)
+               (browser-session-profile-directory nil)
+               (browser-session-profile-root nil)
+               (browser-session-timeout ytm-radio-helper-login-timeout))
+           (browser-session-prepare-profile
+            :url ytm-radio--music-origin
+            :browser browser
+            :profile-directory profile-directory
+            :profile-root profile-root
+            :callback (lambda (_metadata)
+                        (setq ytm-radio--login-process nil)
+                        (ytm-radio--set-login-status nil)
+                        (message "Login profile prepared; importing account session...")
+                        (ytm-radio--start-login output))
+            :errorback (lambda (browser-error)
+                         (setq ytm-radio--login-process nil)
+                         (ytm-radio--set-login-status nil)
+                         (message "Browser session failed: %s"
+                                  (browser-session-error-message browser-error))))))
+      (error
+       (setq ytm-radio--login-process nil)
+       (ytm-radio--set-login-status nil)
+       (signal (car error) (cdr error))))))
 
 ;;;###autoload
 (defun ytm-radio-doctor ()

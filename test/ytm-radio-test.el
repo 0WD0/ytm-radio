@@ -5119,6 +5119,7 @@ STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
          (program (expand-file-name "program" directory))
          (auth-file (expand-file-name "auth.json" directory))
          (ytm-radio-helper-command program)
+         (browser-session-helper-command program)
          (ytm-radio-mpv-program program)
          (ytm-radio-yt-dlp-program program)
          (ytm-radio-data-directory directory)
@@ -5138,6 +5139,7 @@ STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
           (let ((report (ytm-radio--doctor-report)))
             (should (string-match-p "^helper[[:space:]]+OK" report))
             (should (string-match-p "^protocol[[:space:]]+OK" report))
+            (should (string-match-p "^browser-session[[:space:]]+OK" report))
             (should (string-match-p "^mpv[[:space:]]+OK" report))
             (should (string-match-p "^yt-dlp[[:space:]]+OK" report))
             (should (string-match-p "^data-dir[[:space:]]+OK" report))
@@ -6287,81 +6289,144 @@ STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
     (should (ytm-radio--browser-root-active-p 'explore))
     (should-not (ytm-radio--browser-root-active-p 'home))))
 
-(ert-deftest ytm-radio-helper-login-arguments ()
-  "Build Rust helper arguments for the browser login window."
-  (let ((ytm-radio-helper-login-browser "dia")
-        (ytm-radio-helper-login-profile-directory "/tmp/ytm-login-profile")
-        (ytm-radio-helper-login-cdp-port 29999)
-        (ytm-radio-helper-login-timeout 60)
-        (ytm-radio-proxy-url "socks5h://127.0.0.1:7890"))
-    (should
-     (equal
-      (ytm-radio--helper-login-arguments "/tmp/ytm-auth.json")
-      '("auth"
-        "login-window"
-        "--output"
-        "/tmp/ytm-auth.json"
-        "--port"
-        "29999"
-        "--timeout-secs"
-        "60"
-        "--proxy"
-        "socks5h://127.0.0.1:7890"
-        "--profile-dir"
-        "/tmp/ytm-login-profile"
-        "--browser"
-        "dia")))))
+(ert-deftest ytm-radio-browser-session-script-follows-symlinked-source ()
+  "Find the provider script beside a straight-style symlinked source file."
+  (let* ((root (make-temp-file "ytm-radio-script-" t))
+         (build-directory (expand-file-name "build" root))
+         (source-directory (expand-file-name "source" root))
+         (source-el (expand-file-name "ytm-radio.el" source-directory))
+         (source-script (expand-file-name "ytm-radio-session.js" source-directory))
+         (build-el (expand-file-name "ytm-radio.el" build-directory)))
+    (unwind-protect
+        (progn
+          (make-directory build-directory)
+          (make-directory source-directory)
+          (with-temp-file source-el
+            (insert ";; source marker\n"))
+          (with-temp-file source-script
+            (insert "(() => null)()\n"))
+          (condition-case error
+              (make-symbolic-link source-el build-el)
+            (file-error
+             (ert-skip (format "Cannot create a symbolic link: %s"
+                               (error-message-string error)))))
+          (let ((ytm-radio--directory (file-name-as-directory build-directory)))
+            (should (equal (ytm-radio--browser-session-script-file)
+                           source-script))))
+      (delete-directory root t))))
 
-(ert-deftest ytm-radio-helper-login-arguments-auto-browser ()
-  "Use helper browser defaults without explicit browser or profile overrides."
-  (let ((ytm-radio-helper-login-browser nil)
-        (ytm-radio-helper-login-profile-directory nil)
-        (ytm-radio-helper-login-cdp-port 29999)
-        (ytm-radio-helper-login-timeout 60))
-    (should
-     (equal
-      (ytm-radio--helper-login-arguments "/tmp/ytm-auth.json")
-      '("auth"
-        "login-window"
-        "--output"
-        "/tmp/ytm-auth.json"
-        "--port"
-        "29999"
-        "--timeout-secs"
-        "60")))))
+(ert-deftest ytm-radio-browser-session-login-settings ()
+  "Pass account-login settings directly to browser-session."
+  (let* ((directory (make-temp-file "ytm-radio-login-" t))
+         (ytm-radio-data-directory directory)
+         (ytm-radio-helper-login-browser "dia")
+         (ytm-radio-helper-login-profile-directory "/tmp/ytm-login-profile")
+         (ytm-radio-helper-login-cdp-port 29999)
+         (ytm-radio-helper-login-timeout 60)
+         (ytm-radio-proxy-url "socks5h://127.0.0.1:7890")
+         (ytm-radio--login-process nil)
+         (ytm-radio--login-status nil)
+         captured
+         captured-port
+         captured-timeout
+         captured-proxy)
+    (unwind-protect
+        (cl-letf (((symbol-function 'browser-session-capture)
+                   (lambda (&rest arguments)
+                     (setq captured arguments
+                           captured-port browser-session-cdp-port
+                           captured-timeout browser-session-timeout
+                           captured-proxy browser-session-proxy)
+                     'capture-process))
+                  ((symbol-function 'message)
+                   (lambda (&rest _arguments) nil)))
+          (ytm-radio--start-login "/tmp/ytm-auth.json")
+          (should (equal (plist-get captured :url) ytm-radio--music-origin))
+          (should (equal (plist-get captured :any-cookies)
+                         '("__Secure-3PAPISID" "SAPISID")))
+          (should (plist-get captured :all-origin-cookies))
+          (should (equal (plist-get captured :browser) "dia"))
+          (should (equal (plist-get captured :profile-directory)
+                         "/tmp/ytm-login-profile"))
+          (should-not (plist-get captured :profile-root))
+          (should (equal captured-port 29999))
+          (should (equal captured-timeout 60))
+          (should (equal captured-proxy "socks5h://127.0.0.1:7890"))
+          (should (equal ytm-radio--login-status "Login waiting in browser..."))
+          (ytm-radio--delete-browser-session-capture
+           (plist-get captured :output-file)))
+      (delete-directory directory t))))
 
-(ert-deftest ytm-radio-helper-prepare-login-arguments ()
-  "Build helper arguments for preparing an isolated login profile."
-  (let ((ytm-radio-helper-login-browser "firefox")
-        (ytm-radio-helper-login-profile-directory "/tmp/ytm-login-profile")
-        (ytm-radio-helper-login-timeout 60))
-    (should
-     (equal
-      (ytm-radio--helper-prepare-login-arguments "/tmp/ytm-auth.json")
-      '("auth"
-        "prepare-login-profile"
-        "--output"
-        "/tmp/ytm-auth.json"
-        "--timeout-secs"
-        "60"
-        "--profile-dir"
-        "/tmp/ytm-login-profile"
-        "--browser"
-        "firefox")))))
+(ert-deftest ytm-radio-browser-session-default-profile-root ()
+  "Use ytm-radio data directory for browser-session automatic profiles."
+  (let ((ytm-radio-data-directory "/tmp/ytm-radio-data")
+        (ytm-radio-helper-login-profile-directory nil))
+    (should (equal (ytm-radio--browser-session-profile-root)
+                   "/tmp/ytm-radio-data"))))
 
-(ert-deftest ytm-radio-helper-login-profile-default-is-helper-managed ()
-  "Leave default account login profile selection to the helper."
-  (should-not ytm-radio-helper-login-profile-directory))
+(ert-deftest ytm-radio-helper-import-capture-arguments ()
+  "Build ytm helper arguments that consume a browser-session capture."
+  (should
+   (equal
+    (ytm-radio--helper-import-capture-arguments
+     "/tmp/capture.json" "/tmp/ytm-auth.json")
+    '("auth" "import-capture" "--capture" "/tmp/capture.json"
+      "--output" "/tmp/ytm-auth.json"))))
 
-(ert-deftest ytm-radio-helper-login-arguments-restart-running ()
-  "Pass --restart-running only for confirmed browser restart retries."
-  (let ((ytm-radio-helper-login-browser nil)
-        (ytm-radio-helper-login-profile-directory nil)
-        (ytm-radio-helper-login-cdp-port 29999)
-        (ytm-radio-helper-login-timeout 60))
-    (should
-     (member "--restart-running"
-             (ytm-radio--helper-login-arguments "/tmp/ytm-auth.json" t)))))
+(ert-deftest ytm-radio-browser-session-login-allows-confirmed-restart ()
+  "Pass RESTART-RUNNING directly to browser-session."
+  (let* ((directory (make-temp-file "ytm-radio-login-" t))
+         (ytm-radio-data-directory directory)
+         (ytm-radio--login-process nil)
+         (ytm-radio--login-status nil)
+         captured)
+    (unwind-protect
+        (cl-letf (((symbol-function 'browser-session-capture)
+                   (lambda (&rest arguments)
+                     (setq captured arguments)
+                     'capture-process))
+                  ((symbol-function 'message)
+                   (lambda (&rest _arguments) nil)))
+          (ytm-radio--start-login "/tmp/ytm-auth.json" t)
+          (should (plist-get captured :restart-running))
+          (ytm-radio--delete-browser-session-capture
+           (plist-get captured :output-file)))
+      (delete-directory directory t))))
+
+(ert-deftest ytm-radio-browser-session-retries-after-confirmed-restart ()
+  "Retry browser-session capture once after a confirmed restart request."
+  (let* ((directory (make-temp-file "ytm-radio-login-" t))
+         (ytm-radio-data-directory directory)
+         (ytm-radio--login-process nil)
+         (ytm-radio--login-status nil)
+         (attempts 0)
+         capture-files
+         second-arguments)
+    (unwind-protect
+        (cl-letf (((symbol-function 'browser-session-capture)
+                   (lambda (&rest arguments)
+                     (setq attempts (1+ attempts)
+                           capture-files (cons (plist-get arguments :output-file)
+                                               capture-files))
+                     (if (= attempts 1)
+                         (funcall
+                          (plist-get arguments :errorback)
+                          '((code . "browser-restart-required")
+                            (message . "Close the browser")
+                            (retryable . nil)
+                            (auth-required . nil)))
+                       (setq second-arguments arguments))
+                     (format "capture-process-%s" attempts)))
+                  ((symbol-function 'yes-or-no-p)
+                   (lambda (_prompt) t))
+                  ((symbol-function 'message)
+                   (lambda (&rest _arguments) nil)))
+          (ytm-radio--start-login "/tmp/ytm-auth.json")
+          (should (= attempts 2))
+          (should (plist-get second-arguments :restart-running)))
+      (dolist (file capture-files)
+        (ytm-radio--delete-browser-session-capture file))
+      (delete-directory directory t))))
 
 (ert-deftest ytm-radio-browser-login-detects-restartable-error-code ()
   "Detect the stable helper error code that permits browser restart."
@@ -6414,63 +6479,132 @@ STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
       (should (equal ytm-radio--login-status "Login waiting in browser...")))))
 
 (ert-deftest ytm-radio-browser-login-runs-continuation-after-success ()
-  "Run the pending account action after login imports auth."
-  (let ((ytm-radio--state (ytm-radio--make-state))
-        (ytm-radio--loaded t)
-        (ytm-radio--login-process nil)
-        (ytm-radio--login-continuation nil)
-        (ytm-radio--login-status nil)
-        (ytm-radio-helper-auth-file "/tmp/ytm-auth.json")
-        ran-continuation
-        started-home)
-    (cl-letf (((symbol-function 'ytm-radio--call-helper-async)
-               (lambda (_arguments success _error-callback)
-                 (funcall success '((auth . t)))
-                 nil))
-              ((symbol-function 'ytm-radio--save)
-               (lambda () nil))
-              ((symbol-function 'ytm-radio--start-home-load)
-               (lambda (&optional _append)
-                 (setq started-home t))))
-      (ytm-radio--start-login
-       "/tmp/ytm-auth.json"
-       nil
-       (lambda ()
-         (setq ran-continuation t)))
-      (should ran-continuation)
-      (should-not started-home)
-      (should-not ytm-radio--login-status)
-      (should-not ytm-radio--login-continuation))))
+  "Run the pending account action after browser-session import succeeds."
+  (let* ((directory (make-temp-file "ytm-radio-login-" t))
+         (ytm-radio-data-directory directory)
+         (ytm-radio--state (ytm-radio--make-state))
+         (ytm-radio--loaded t)
+         (ytm-radio--login-process nil)
+         (ytm-radio--login-continuation nil)
+         (ytm-radio--login-status nil)
+         (ytm-radio-helper-auth-file "/tmp/ytm-auth.json")
+         ran-continuation
+         started-home
+         captured-import)
+    (unwind-protect
+        (cl-letf (((symbol-function 'browser-session-capture)
+                   (lambda (&rest arguments)
+                     (funcall (plist-get arguments :callback)
+                              '((browser . "chrome")))
+                     nil))
+                  ((symbol-function 'ytm-radio--call-helper-async)
+                   (lambda (arguments success _error-callback)
+                     (setq captured-import arguments)
+                     (funcall success '((auth . t)))
+                     nil))
+                  ((symbol-function 'ytm-radio--save)
+                   (lambda () nil))
+                  ((symbol-function 'ytm-radio--start-home-load)
+                   (lambda (&optional _append)
+                     (setq started-home t))))
+          (ytm-radio--start-login
+           "/tmp/ytm-auth.json"
+           nil
+           (lambda ()
+             (setq ran-continuation t)))
+          (should (equal (seq-take captured-import 2)
+                         '("auth" "import-capture")))
+          (should ran-continuation)
+          (should-not started-home)
+          (should-not ytm-radio--login-status)
+          (should-not ytm-radio--login-continuation))
+      (delete-directory directory t))))
+
+(ert-deftest ytm-radio-login-handoff-runs-both-helper-boundaries ()
+  "Capture through browser-session before ytm helper imports provider auth."
+  (skip-unless (and (executable-find "sh")
+                    (ytm-radio-test--contract-helper)))
+  (let* ((directory (make-temp-file "ytm-radio-login-handoff-" t))
+         (browser-helper (expand-file-name "browser-session" directory))
+         (auth-file (expand-file-name "auth.json" directory))
+         (capture-json
+          (json-serialize
+           `((schema . 1)
+             (source . ((browser . "fake")
+                        (url . ,ytm-radio--music-origin)
+                        (user_agent . "Source UA")))
+             (cookies . ,(vector
+                          `((name . "SAPISID")
+                            (value . ,(format "test-%s" (emacs-pid)))
+                            (domain . ".youtube.com")
+                            (expires . 0.0))))
+             (page . ((sessionIndex . "1") (userAgent . "Page UA"))))))
+         (ytm-radio-data-directory directory)
+         (ytm-radio-helper-auth-file auth-file)
+         (ytm-radio-helper-command (ytm-radio-test--contract-helper))
+         (browser-session-helper-command browser-helper)
+         (ytm-radio--state (ytm-radio--make-state))
+         (ytm-radio--loaded t)
+         (ytm-radio--login-process nil)
+         (ytm-radio--login-continuation nil)
+         (ytm-radio--login-status nil)
+         done)
+    (unwind-protect
+        (progn
+          (with-temp-file browser-helper
+            (insert "#!/bin/sh\n"
+                    "output=\n"
+                    "while [ \"$#\" -gt 0 ]; do\n"
+                    "  if [ \"$1\" = \"--output\" ]; then output=\"$2\"; shift 2; else shift; fi\n"
+                    "done\n"
+                    "printf '%s' '"
+                    (replace-regexp-in-string "'" "'\\\"'\\\"'" capture-json)
+                    "' > \"$output\"\n"
+                    "chmod 600 \"$output\"\n"
+                    "printf '%s\\n' '{\"ok\":true,\"schema\":1,\"protocol\":1,\"data\":{\"browser\":\"fake\",\"output\":\"/tmp/capture.json\"},\"warnings\":[]}'\n"))
+          (set-file-modes browser-helper #o700)
+          (cl-letf (((symbol-function 'ytm-radio--save) #'ignore))
+            (ytm-radio--start-login auth-file nil (lambda () (setq done t)))
+            (with-timeout (5 (ert-fail "browser-session login handoff timed out"))
+              (while (not done)
+                (accept-process-output nil 0.1))))
+          (should (file-readable-p auth-file))
+          (should-not
+           (directory-files directory nil "\\`\\.browser-session-.*\\.json\\'")))
+      (delete-directory directory t))))
 
 (ert-deftest ytm-radio-prepare-login-imports-after-profile-closes ()
-  "Import account auth after the ordinary profile window exits."
-  (let ((ytm-radio--login-process nil)
-        (ytm-radio--login-status nil)
-        (ytm-radio-helper-auth-file "/tmp/ytm-auth.json")
-        captured-arguments
-        imported-output)
-    (cl-letf (((symbol-function 'ytm-radio--call-helper-async)
-               (lambda (arguments success _error-callback)
-                 (setq captured-arguments arguments)
-                 (funcall success '((profile . "/tmp/profile")))
-                 nil))
-              ((symbol-function 'ytm-radio--start-login)
-               (lambda (output &optional _restart-running _after-success)
-                 (setq imported-output output)))
-              ((symbol-function 'message)
-               (lambda (&rest _arguments) nil)))
-      (ytm-radio-prepare-login)
-      (should
-       (equal
-        captured-arguments
-        '("auth"
-          "prepare-login-profile"
-          "--output"
-          "/tmp/ytm-auth.json"
-          "--timeout-secs"
-          "180")))
-      (should (equal imported-output "/tmp/ytm-auth.json"))
-      (should-not ytm-radio--login-status))))
+  "Import account auth after browser-session profile preparation closes."
+  (let* ((directory (make-temp-file "ytm-radio-login-" t))
+         (ytm-radio-data-directory directory)
+         (ytm-radio--login-process nil)
+         (ytm-radio--login-status nil)
+         (ytm-radio-helper-auth-file "/tmp/ytm-auth.json")
+         captured-arguments
+         captured-timeout
+         imported-output)
+    (unwind-protect
+        (cl-letf (((symbol-function 'browser-session-prepare-profile)
+                   (lambda (&rest arguments)
+                     (setq captured-arguments arguments
+                           captured-timeout browser-session-timeout)
+                     (funcall (plist-get arguments :callback)
+                              '((profile . "/tmp/profile")))
+                     nil))
+                  ((symbol-function 'ytm-radio--start-login)
+                   (lambda (output &optional _restart-running _after-success)
+                     (setq imported-output output)))
+                  ((symbol-function 'message)
+                   (lambda (&rest _arguments) nil)))
+          (ytm-radio-prepare-login)
+          (should (equal (plist-get captured-arguments :url)
+                         ytm-radio--music-origin))
+          (should (equal captured-timeout 180))
+          (should (equal (plist-get captured-arguments :profile-root)
+                         directory))
+          (should (equal imported-output "/tmp/ytm-auth.json"))
+          (should-not ytm-radio--login-status))
+      (delete-directory directory t))))
 
 (ert-deftest ytm-radio-account-auth-failure-starts-login ()
   "Treat structured auth errors as a prompt to refresh account auth."
